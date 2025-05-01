@@ -3,6 +3,7 @@ import cv2 # OpenCV to read images
 import numpy as np
 from skimage.feature import local_binary_pattern
 from sklearn.preprocessing import LabelEncoder
+from imblearn.over_sampling import SMOTE
 
 # LBP Settings
 LBP_RADIUS = 1
@@ -32,6 +33,10 @@ def extract_lbp_features(image, numPoints=LBP_POINTS, radius=LBP_RADIUS):
         convert  into decimal = 102 and this the LBP value
 
     """
+    # Check and convert data type if necessary
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+    
     # We convert the image to gray (Grayscale) because LBP only works on exposure.
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) 
     # We select a central pixel and around it a set of pixels (their number is determined by numPoints = 8, radius = 1,and method = LBP_METHOD = 'uniform').
@@ -84,6 +89,10 @@ def extract_lbp_features(image, numPoints=LBP_POINTS, radius=LBP_RADIUS):
         - It complements LBP, which focuses more on texture.
 """
 def extract_intensity_histogram(image, bins=32):
+    # Check and convert data type if necessary
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+    
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) # We convert the image from BGR to gray to focus on exposure only.
     hist = cv2.calcHist([gray], [0], None, [bins], [0, 256])
     hist = cv2.normalize(hist, hist).flatten()
@@ -217,8 +226,14 @@ def extract_features_from_folder(folder_path, image_size=(128, 128)):
             features.append(feature_vector)
             labels.append(label_name)
 
+    # Encode labels
     le = LabelEncoder()# convert the classes into int 
     encoded_labels = le.fit_transform(labels)
+    
+    # Handle class imbalance using SMOTE
+    smote = SMOTE(random_state=42)
+    features, encoded_labels = smote.fit_resample(features, encoded_labels)
+    
     return np.array(features), encoded_labels, le
 
 features, labels, label_encoder = extract_features_from_folder(r'../data/PlantVillage')
