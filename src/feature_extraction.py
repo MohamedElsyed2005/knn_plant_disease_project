@@ -1,159 +1,212 @@
-import os # deals with folder and files
-import cv2 # OpenCV to read images
+import os
+import cv2
 import numpy as np
-from skimage.feature import local_binary_pattern
 from sklearn.preprocessing import LabelEncoder
-from imblearn.over_sampling import SMOTE
+import joblib
+from joblib import Parallel, delayed
+import multiprocessing
+from skimage.feature import hog
+from sklearn.decomposition import PCA
+import albumentations as A
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
 
-# LBP Settings
-LBP_RADIUS = 1
-LBP_POINTS = 8 * LBP_RADIUS
-LBP_METHOD = "uniform"
 
-def extract_lbp_features(image, numPoints=LBP_POINTS, radius=LBP_RADIUS):
+
+transform = A.Compose([
+    A.HorizontalFlip(p=0.5), # 50% chance of horizontal flip
+    A.VerticalFlip(p=0.2), # 20% chance of vertical flip
+    A.RandomBrightnessContrast(p=0.3), # 30% chance of adjusting brightness/contrast
+    A.ShiftScaleRotate(
+        shift_limit=0.05, # Shift by 5% in any direction
+        scale_limit=0.1,  # Scale up or down by 10%
+        rotate_limit=15,  # Rotate by ±15 degrees
+        p=0.5),           # 50% chance of applying this
+])
+
+
+def augment_image(image):
     """
-    This function extracts texture features from a particular image using a technique called Local Binary Pattern (LBP),
-    an effective way to recognize patterns in images, such as the texture of the affected paper in the disease classification project.
-        
-        Example
-        [[  90   110  120 ]
-        [   85   100   95 ]   =  center = 100
-        [  130   105   80 ]]
-
-        1- compare each neighbor with center:
-            if the neighbor > center => 1
-            else => 0 
-            
-        [[ 0   1   1 ]
-        [  0       0 ]
-        [  1   1   0 ]]
-
-        Read with the hands of the clock
-        --> 01100110
-        convert  into decimal = 102 and this the LBP value
-
-    """
-    # Check and convert data type if necessary
-    if image.dtype != np.uint8:
-        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+    This line applies a set of predefined augmentations (random image transformations)
+    to the input image using Albumentations, a powerful image augmentation library.
     
-    # We convert the image to gray (Grayscale) because LBP only works on exposure.
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) 
-    # We select a central pixel and around it a set of pixels (their number is determined by numPoints = 8, radius = 1,and method = LBP_METHOD = 'uniform').
-    # compare each neighbor with center:
-    #        if the neighbor > center => 1
-    #        else => 0 
-    lbp = local_binary_pattern(gray, numPoints, radius, method=LBP_METHOD)
-    # Converting an LBP image to a Histogram (frequency chart) represents the number of times each LBP value is repeated.
-    (hist, _) = np.histogram(lbp.ravel(),          # single out the two-dimensional matrix LBP into a straight line (1D array).
-                             bins=np.arange(0, numPoints + 3), # bins=np.arange(0, (8+3) = 11) ==> [0,1,2,3,4,5,6,7,8,9,10]
-                             range=(0, numPoints + 2)) # This is the full range of values that can appear in LBP.
-    hist = hist.astype("float")
-    hist /= (hist.sum() + 1e-7)
-    """
-    exmple:
-        >>> lbp = [[0, 1, 1],
-                  [2, 2, 1],
-                  [0, 9, 8]]
-        >>> (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, numPoints + 3), range=(0, numPoints + 2))
-        >>> lbp.revel()
-            [0, 1, 1, 2, 2, 1, 0, 9, 8]
-        >>> bins = [0,1,2,3,4,5,6,7,8,9,10]
+    The transform object is created using A.Compose([]), which means it is a list of multiple transformations.
 
-        | values | Number of impressions|
-        |--------|----------------------|
-        | 0      | 2                    |
-        | 1      | 3                    |
-        | 2      | 2                    |
-        | 3      | 0                    |
-        | 4      | 0                    |
-        | 5      | 0                    |
-        | 6      | 0                    |
-        | 7      | 0                    |
-        | 8      | 1                    |
-        | 9      | 1                    |
-        ---------------------------------
-        >>> hist = [2, 3, 2, 0, 0, 0, 0, 0, 1, 1]
-        >>> hist = hist.astype("float")
-        ... hist /= (hist.sum() + 1e-7)  
-        hist = hist = [0.222, 0.333, 0.222, 0, ..., 0.111, 0.111]   
-    """
-    return hist
+    The result of applying this transformation is a dictionary that looks like this:
+    >>> augmented = transform(image=image)
+    augmented = {
+        'image': <Augmented_Image_Array>,
+        'other_keys_if_present': ...
+    }
+    >>> augmented['image']
+    to get the <Augmented_Image_Array>
+    example: 
+    [[ 1, 2, 3 ],
+    [ 4, 5, 6 ],
+    [ 7, 8, 9 ]]
 
-#The extract_intensity_histogram function calculates Histogram for brightness (intensity) of the image (after converting it to grayscale).
-"""
-### Why use Intensity Histogram?
-        - With your own hands an idea of the distribution of lighting in the photo.
-        - Very useful in agricultural or medical images, because the disease sometimes changes the brightness of parts of the leaf.
-        - Easy and fast in calculating.
-        - It complements LBP, which focuses more on texture.
-"""
-def extract_intensity_histogram(image, bins=32):
-    # Check and convert data type if necessary
-    if image.dtype != np.uint8:
-        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+    flip horizontal:      |   flip vertical   
+        [[ 3, 2, 1 ],     |     [[ 7, 8, 9 ],
+        [ 6, 5, 4 ],      |     [ 4, 5, 6 ],
+        [ 9, 8, 7 ]]      |     [ 1, 2, 3 ]]
+
+    """
+    augmented = transform(image=image)
+    return augmented['image']
+
+def preprocess_image(image, target_size=(96, 96)):
+    if image is None:
+        print("Error: Image not loaded properly.")
+        return None
+    image = cv2.resize(image, target_size) # resize from (255,255,3) into (96, 96)
+    """
+    You asked:
+    "How is it even possible to resize a (250, 250, 3) image down to (96, 96)?"
+    (Without breaking or damaging the image?)
+
+    The program does NOT cut or remove parts of the image.
+    Instead, it uses a mathematical method called interpolation to smartly "resize" the content.
+
+    What is Interpolation?
+    Simply:
+    - Instead of just deleting pixels, interpolation calculates new pixel values.
+    - It uses nearby pixels to guess how the new pixels should look.
+
+    | Interpolation Method     | OpenCV Flag         | Best For                   | Speed       | Quality      | Notes                                 |
+    |--------------------------|---------------------|----------------------------|------------ |--------------|---------------------------------------|
+    |   Nearest Neighbor       |  cv2.INTER_NEAREST  | Binary masks, segmentation | **Fastest** | **Lowest**   | May look blocky, no smoothing         |
+    |   Bilinear (Default)     |  cv2.INTER_LINEAR   | General use Upscaling      | Fast        | Good         | Default method, smooth results        |
+    |   Bicubic                |  cv2.INTER_CUBIC    | Upscaling images           | Slower      | Better       | Sharper than bilinear                 |
+    |   Area-based             |  cv2.INTER_AREA     |   Downscaling              | Fast        | Very Good    | Maintains image quality when shrinking|
+    |   Lanczos                |  cv2.INTER_LANCZOS4 | High-quality upscaling     | Slowest     | Best         | For fine detail, computationally heavy|
+    ----------------------------------------------------------------------------------------------------------------------------------------------------
     
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) # We convert the image from BGR to gray to focus on exposure only.
-    hist = cv2.calcHist([gray], [0], None, [bins], [0, 256])
-    hist = cv2.normalize(hist, hist).flatten()
+    default 
+    >>> image = cv2.resize(img, (128, 128), interpolation=cv2.INTER_LINEAR)
+    """ 
+    # convert image from RGB (blue, green, red) into LAB (Lightness, A: green to red, B: blue to yellow)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)                                  # split into L, A, B
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization).
+    # It improves brightness in dark and bright areas without losing details.
+    # clipLimit=2.0: Sets a maximum contrast limit to avoid over-enhancement.
+    # tileGridSize=(8,8): Defines the size of the grid for contrast enhancement (8x8 means the image is divided into small tiles).
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)) 
+    l = clahe.apply(l)                                        # Apply CLAHE only on the Lightness channel (L)
+    lab = cv2.merge([l, a, b])                               # Merge the three channels back after enhancement
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)          # Convert the enhanced LAB image back to BGR
+    return enhanced
 
-    """
-    [gray]: Gray image as source.
-    [0]: Color channel used (brightness channel).
-    None: No mask (meaning we count for each image).
-    [bins]: The number of digits in which we divide values (by default 32 digits).
-    [0, 256]: Range of brightness (from black = 0 to white = 255).
-    flatten(): We convert it from a 2D array (z [32, 1]) to vector 1D (z [32]) so it stays easy to use as a feature.
-    
-    Example:
-    >>> [gray] =[[  0,  50, 100, 150],
-                [200, 255,  50, 100],
-                [150, 200,  0, 255],
-                [ 50, 100, 150, 200]]
-    >>> hist = cv2.calcHist([gray], [0], None, [4], [0, 256])
+# Function to extract color features from an image
+def extract_color_features(image):
+    features = []
+    # Convert the image to HSV (Hue, Saturation, Value) and LAB color spaces
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
 
-    Here bins = 4 → its meaning is to divide brightness degrees into 4 groups:
-        1- [0-64)
-        2- [64-128)
-        3- [128-192)
-        4- [192-256)
+    # Loop through both color spaces (HSV and LAB)
+    for color_space in [hsv, lab]:
+        # Split the color space into its channels
+        for channel in cv2.split(color_space):
+            # Calculate the mean and standard deviation of each channel
+            mean = np.mean(channel)
+            std = np.std(channel)
+            features.extend([mean, std])
 
-        | Bin Range    | number of Pixels   |        Notes                    |
-        |--------------|--------------------|---------------------------------|
-        | 0-64         | 4                  | values: 0, 50, 50, 50           |
-        | 64-128       | 3                  | values: 100, 100, 100           |
-        | 128-192      | 3                  | values: 150, 150, 150           |
-        | 192-256      | 6                  | values: 200, 200, 200, 255, 255 |
-        -----------------------------------------------------------------------
+    # Return color features as a flattened NumPy array
+    return np.array(features, dtype=np.float32)
 
-    >>> hist = [4.0, 3.0, 3.0, 6.0]
-    >>> cv2.normalize(hist, hist).flatten()
-    ... hist = [0.2, 0.15, 0.15, 0.3] Sum = 1
-    """
-    return hist
+# Function to extract texture features using HOG (Histogram of Oriented Gradients)
+def extract_texture_features(image):
+    # Convert the image to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-def extract_features_from_folder(folder_path, image_size=(128, 128)):
+    # Extract HOG features from the grayscale image
+    hog_features = hog(gray, orientations=9, pixels_per_cell=(8, 8),
+                       cells_per_block=(2, 2), visualize=False)
+
+    # Return HOG features
+    return hog_features
+
+# Function to extract disease-specific features (infected ratio) from the image
+def extract_disease_features(image):
+    # Convert the image to HSV and use the V (brightness) channel
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    _, _, v = cv2.split(hsv)
+
+    # Calculate the ratio of dark pixels (potentially infected areas)
+    infected_ratio = np.mean(v < 100)
+
+    # Return this value as a single-element NumPy array
+    return np.array([infected_ratio], dtype=np.float32)
+
+# Load a pre-trained MobileNetV2 model (without the top classification layer)
+mobilenet_model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg', input_shape=(96, 96, 3))
+
+# Function to extract deep learning features using MobileNetV2
+def extract_deep_features(image):
+    # Convert the image to RGB format and resize to MobileNetV2's input size
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, (96, 96))
+
+    # Convert the image to an array and preprocess it for MobileNetV2
+    x = img_to_array(img_resized)
+    x = np.expand_dims(x, axis=0)
+    x = preprocess_input(x)
+
+    # Extract deep features using MobileNetV2
+    features = mobilenet_model.predict(x)
+
+    # Flatten the feature map to a one-dimensional array
+    return features.flatten()
+
+# Master function to extract all features (color, texture, disease, deep features)
+def extract_features(image):
+    color_features = extract_color_features(image)
+    texture_features = extract_texture_features(image)
+    disease_features = extract_disease_features(image)
+    deep_features = extract_deep_features(image)
+
+    # Concatenate all features into one vector
+    return np.concatenate([color_features, texture_features, disease_features, deep_features])
+
+def process_single_image(img_path, target_size=(96, 96)):
+    image = cv2.imread(img_path) # laod images
+    if image is None:
+        print(f"Warning: Could not load image {img_path}. Skipping...")
+        return None, None
+
+    image = augment_image(image)  # apply augmentations
+
+    processed_image = preprocess_image(image, target_size) # apply preprocessing
+    if processed_image is None:
+        return None, None
+    features = extract_features(processed_image)
+    return features, os.path.basename(os.path.dirname(img_path))
+
+def extract_features_from_folder(folder_path, target_size=(96, 96)):
     """
     the structure of data 
-    data/
-        |
-        ├──PlantVillage/
-                ├── Pepper__bell___Bacterial_spot
-                ├── Pepper__bell___healthy
-                ├── Potato___Early_blight
-                ├── Potato___Early_blight
-                ├── Potato___healthy
-                ├── Potato___Late_blight
-                ├── Tomato__Target_Spot
-                ├── Tomato__Tomato_mosaic_virus
-                ├── Tomato__Tomato_YellowLeaf__Curl_Virus
-                ├── Tomato_Bacterial_spot
-                ├── Tomato_Early_blight
-                ├── Tomato_healthy
-                ├── Tomato_Late_blight
-                ├── Tomato_Leaf_Mold
-                ├── Tomato_Septoria_leaf_spot
-                ├── Tomato_Spider_mites_Two_spotted_spider_mite
+        data/
+            |
+            ├──PlantVillage/
+                    ├── Pepper__bell___Bacterial_spot
+                    ├── Pepper__bell___healthy
+                    ├── Potato___Early_blight
+                    ├── Potato___Early_blight
+                    ├── Potato___healthy
+                    ├── Potato___Late_blight
+                    ├── Tomato__Target_Spot
+                    ├── Tomato__Tomato_mosaic_virus
+                    ├── Tomato__Tomato_YellowLeaf__Curl_Virus
+                    ├── Tomato_Bacterial_spot
+                    ├── Tomato_Early_blight
+                    ├── Tomato_healthy
+                    ├── Tomato_Late_blight
+                    ├── Tomato_Leaf_Mold
+                    ├── Tomato_Septoria_leaf_spot
+                    ├── Tomato_Spider_mites_Two_spotted_spider_mite
     --------------------------------------------------------------------------------------------------
     to read the data from each folder. we need to os library to deal with folders and files 
         >>> import os 
@@ -161,79 +214,99 @@ def extract_features_from_folder(folder_path, image_size=(128, 128)):
         
     >>> os.listdir ==> to get all folders names
     Example:
-        >>> classes = os.listdir(folder_path) 
-        >>> classes = ["Pepper__bell___Bacterial_spot","Pepper__bell___healthy","PlantVillage", ... ...]
+        >>> os.listdir(folder_path) 
+        >>> ["Pepper__bell___Bacterial_spot","Pepper__bell___healthy", "Potato___Early_blight", ...]
 
     >>> os.path.join ==> combine the folder path with inner folder to get their path
     Example:
-        >>> folder_path = "PlantVillage"
-        ... label = "Apple___Black_rot"
-        ... full_path = os.path.join(folder_path, label)
-        >>> full_path
-        PlantVillage\Apple___Black_rot
+        >>> folder_path = "..//data//PlantVillage"
+        ... label_name = "Pepper__bell___Bacterial_spot"
+        ... label_folder = os.path.join(folder_path, label_name)
+        >>> label_folder
+        ..//data//PlantVillage//Pepper__bell___Bacterial_spot
+    
+    >>> os.listdir(label_folder)
+    Example: 
+        >>> label_folder = "..//data//PlantVillage//Pepper__bell___Bacterial_spot"
+        ... os.listdir(label_folder)
+        ["0a0dbf1f-1131-496f-b337-169ec6693e6f___NREC_B.Spot 9241.JPG", "0a4c007d-41ab-4659-99cb-8a4ae4d07a55___NREC_B.Spot 1954.JPG", ...]
+        >>> all_paths.append(os.path.join(label_folder, img_name))
+        ["..//data//PlantVillage//Pepper__bell___Bacterial_spot//0a0dbf1f-1131-496f-b337-169ec6693e6f___NREC_B.Spot 9241.JPG", ...]
     ------------------------------------------------------------------------------------------------------------
-
     """
-    features = []
-    labels = []
-    
-    classes = os.listdir(folder_path)
-
-    for label_name in classes:
-
+    all_paths = []
+    for label_name in os.listdir(folder_path):
         label_folder = os.path.join(folder_path, label_name)
-        if not os.path.isdir(label_folder):
+        if not os.path.isdir(label_folder): # check if the path is already exist or not
             continue
-
         for img_name in os.listdir(label_folder):
-            img_path = os.path.join(label_folder, img_name)
-            img = cv2.imread(img_path) # read and convert into array using cv2 = openCV lib (250, 250, 3)
+            all_paths.append(os.path.join(label_folder, img_name))
 
-            if img is None:
-                continue
+    print(f"Processing {len(all_paths)} images...")
 
-            img = cv2.resize(img, image_size) # resize images into (128, 128)
-            """
-            You asked:
-            "How is it even possible to resize a (250, 250, 3) image down to (128, 128, 3)?"
-            (Without breaking or damaging the image?)
-
-            The program does NOT cut or remove parts of the image.
-            Instead, it uses a mathematical method called interpolation to smartly "resize" the content.
-
-            What is Interpolation?
-            Simply:
-            - Instead of just deleting pixels, interpolation calculates new pixel values.
-            - It uses nearby pixels to guess how the new pixels should look.
-
-            | Interpolation Method     | OpenCV Flag         | Best For                   | Speed       | Quality      | Notes                                 |
-            |--------------------------|---------------------|----------------------------|------------ |--------------|---------------------------------------|
-            |   Nearest Neighbor       |  cv2.INTER_NEAREST  | Binary masks, segmentation | **Fastest** | **Lowest**   | May look blocky, no smoothing         |
-            |   Bilinear (Default)     |  cv2.INTER_LINEAR   | General use Upscaling      | Fast        | Good         | Default method, smooth results        |
-            |   Bicubic                |  cv2.INTER_CUBIC    | Upscaling images           | Slower      | Better       | Sharper than bilinear                 |
-            |   Area-based             |  cv2.INTER_AREA     |   Downscaling              | Fast        | Very Good    | Maintains image quality when shrinking|
-            |   Lanczos                |  cv2.INTER_LANCZOS4 | High-quality upscaling     | Slowest     | Best         | For fine detail, computationally heavy|
-            ----------------------------------------------------------------------------------------------------------------------------------------------------
-            
-            default 
-            >>> img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_LINEAR)
-            """
-
-            lbp_feat = extract_lbp_features(img)
-            hist_feat = extract_intensity_histogram(img)
-
-            feature_vector = np.hstack([lbp_feat, hist_feat]) # combine the two features
-            features.append(feature_vector)
-            labels.append(label_name)
-
-    # Encode labels
-    le = LabelEncoder()# convert the classes into int 
-    encoded_labels = le.fit_transform(labels)
+    results = Parallel(n_jobs=multiprocessing.cpu_count() - 1)(
+        delayed(process_single_image)(path, target_size) for path in all_paths)
     
-    # Handle class imbalance using SMOTE
-    smote = SMOTE(random_state=42)
-    features, encoded_labels = smote.fit_resample(features, encoded_labels)
+    """
+    What is Parallel Processing?
+        - Parallel processing is a technique where a task is divided into smaller tasks, which are executed simultaneously on multiple CPU cores.
+        - This can significantly speed up your code, especially when working with large datasets (like images here).
     
-    return np.array(features), encoded_labels, le
+    joblib.Parallel is a utility from the joblib library that makes it very easy to parallelize tasks.
+    It creates multiple parallel workers (processes) to perform tasks faster
 
-features, labels, label_encoder = extract_features_from_folder(r'../data/PlantVillage')
+    Syntax Explanation:
+    >>> Parallel(n_jobs=-1)(delayed(func)(arg1, arg2) for arg1, arg2 in data) # default 
+    ... n_jobs: Number of parallel workers (processes or threads).
+        ... -1 means using all available CPU cores.
+        ... multiprocessing.cpu_count() - 1 means using all CPU cores minus one (keeping one core free to avoid system overload).
+    ... delayed: A utility that makes a function lazy (only runs when called).
+    ... func: The function you want to run in parallel (process_single_image here).
+    ... arg1, arg2: Arguments passed to the function.
+
+    ----------------------------------------------------------------------------------------------------------------------------------------------
+    |              without Parallel                                      |        With Parallel (7 Cores)
+    ----------------------------------------------------------------------------------------------------------------------------------------------
+    | >>> for path in all_paths:                                         | >>> results = Parallel(n_jobs=7)
+    | >>> result = process_single_image(path, target_size)               | ...        (delayed(process_single_image)(path, target_size) for path in all_paths)
+    | >>> results.append(result)                                         |
+    ----------------------------------------------------------------------------------------------------------------------------------------------
+    | If you have 20639 images and each takes 1 second:                  | 7 images are processed every second.
+    | Total time = 20639 seconds (about 344 minutes = 5 h 44 min).       | Total time ≈ 20639  / 7 ≈ 49  min.
+    ----------------------------------------------------------------------------------------------------------------------------------------------
+    >>> results is a list of the outputs from process_single_image:
+    [(features1, label1), (features2, label2), ...]
+    """
+    
+    #            res[0]   res[1]
+    # result = (features1, label1)      
+    features = [res[0] for res in results if res[0] is not None] 
+    labels = [res[1] for res in results if res[0] is not None]
+
+    le = LabelEncoder() 
+    # ["Pepper__bell___Bacterial_spot","Pepper__bell___healthy", "Potato___Early_blight", ...]
+    # convert them into [ 0, 1, 2, ...]
+    encoded_labels = le.fit_transform(labels) 
+
+    # Stacking them vertically using np.vstack
+    features = np.vstack(features)
+    # apply dimensionality reduction using PCA
+    pca = PCA(n_components=min(300, features.shape[1])) # features will be 300 cols
+    features_reduced = pca.fit_transform(features)
+
+    print("Features extracted and reduced.")
+    return features_reduced, encoded_labels, le, pca
+
+if __name__ == "__main__":
+    print("Starting feature extraction...")
+    features, labels, label_encoder, pca = extract_features_from_folder(r'../data/PlantVillage')
+
+    os.makedirs('../saved_data', exist_ok=True)
+
+    print("Saving data...")
+    np.save('../saved_data/features.npy', features)
+    np.save('../saved_data/labels.npy', labels)
+    joblib.dump(label_encoder, '../saved_data/label_encoder.joblib')
+    joblib.dump(pca, '../saved_data/pca_model.joblib')
+
+    print("Data saved successfully.")
