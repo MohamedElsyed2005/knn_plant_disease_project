@@ -71,7 +71,7 @@ This project focuses on building a machine learning model to classify plant dise
 4. Run the feature extraction script:
 
    ```bash
-   python model/feature_extraction.py
+   python src/feature_extraction.py
    ```
 5. Train and evaluate models:
 
