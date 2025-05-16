@@ -55,7 +55,7 @@ This project focuses on building a machine learning model to classify plant dise
 * Confusion Matrix:
 
   * Train:
-    ![Bagging Train Confusion Matrix](./results/confusion_matrix_train_bagging.png)
+    ![Bagging Train Confusion Matrix](./results/confusion_matrix_train.png)
   * Test:
     ![Bagging Test Confusion Matrix](./results/confusion_matrix_Bagging.png)
 
